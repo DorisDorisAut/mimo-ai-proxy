@@ -163,7 +163,9 @@ func main() {
 	}
 
 	// For Docker environments, it's safer to bind to 0.0.0.0 explicitly
-	address := "0.0.0.0:" + port
+	host := os.Getenv("LISTEN_HOST")
+    if host == "" { host = "127.0.0.1" }
+    address := host + ":" + port
 
 	srv := &http.Server{
 		Addr:           address,

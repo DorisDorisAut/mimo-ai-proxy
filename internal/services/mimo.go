@@ -356,7 +356,7 @@ type DialogItem struct {
 }
 
 func GetConversationHistory(auth models.Auth, conversationID string) ([]DialogItem, error) {
-	apiURL := fmt.Sprintf("https://aistudio.xiaomimimo.com/open-apis/chat/dialog/list?xiaomichatbot_ph=%s", url.QueryEscape(auth.Ph))
+	apiURL := MimoDialogURL(auth.Ph)
 
 	payload := map[string]interface{}{
 		"queryParam": map[string]string{
