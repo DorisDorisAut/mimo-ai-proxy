@@ -132,7 +132,7 @@ func handleModels(c *gin.Context) {
 
 func handleDirectProxy(c *gin.Context) {
 	auth := services.GetSelectedAuth()
-	url := fmt.Sprintf("https://aistudio.xiaomimimo.com/open-apis/bot/chat?xiaomichatbot_ph=%s", auth.Ph)
+	url := services.MimoChatURL(auth.Ph)
 
 	body, _ := io.ReadAll(c.Request.Body)
 	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(body))
@@ -373,7 +373,7 @@ func handleChatCompletions(c *gin.Context) {
 	cacheKey := fmt.Sprintf("req_%x", bodyCopy)
 	fmt.Printf("Incoming request size: %d bytes\n", len(bodyCopy))
 	
-	if !strings.Contains(string(bodyCopy), "\"stream\":true") {
+	if os.Getenv("MIMO_STATELESS") != "1" && !strings.Contains(string(bodyCopy), "\"stream\":true") {
 		if cached, found := services.GlobalCache.Get(cacheKey); found {
 			c.JSON(http.StatusOK, cached)
 			return
@@ -484,6 +484,7 @@ func handleChatCompletions(c *gin.Context) {
 
 	var query string
 	convID := input.User
+    if os.Getenv("MIMO_STATELESS") == "1" { convID = "" }
 	var sessionKey string
 	
 	// Automatic Media Upload
@@ -494,7 +495,7 @@ func handleChatCompletions(c *gin.Context) {
 	}
 
 	// AUTOMATIC SESSION DETECTION: If User ID is empty, try to identify conversation by history hash
-	if convID == "" && len(input.Messages) > 0 {
+	if convID == "" && len(input.Messages) > 0 && os.Getenv("MIMO_STATELESS") != "1" {
 		sessionKey = services.GenerateFingerprint(input.Messages)
 		
 		// 1. Try Memory Cache
@@ -717,7 +718,14 @@ func handleChatCompletions(c *gin.Context) {
 		payload.ConversationID = utils.GenerateID()
 	}
 
-	// Retry logic
+	if os.Getenv("MIMO_STATELESS") == "1" {
+        if err := services.CreateConversation(currentAuth, payload.ConversationID); err != nil {
+            utils.SendError(c, http.StatusBadGateway, "MiMo conversation unavailable.", "upstream_error", nil)
+            return
+        }
+    }
+
+    // Retry logic
 	tokensStr := os.Getenv("SERVICE_TOKENS")
 	if tokensStr == "" {
 		tokensStr = os.Getenv("SERVICE_TOKEN")
@@ -733,7 +741,7 @@ func handleChatCompletions(c *gin.Context) {
 
 	for i := 0; i < maxRetries; i++ {
 		auth = services.GetSelectedAuth()
-		url := fmt.Sprintf("https://aistudio.xiaomimimo.com/open-apis/bot/chat?xiaomichatbot_ph=%s", auth.Ph)
+		url := services.MimoChatURL(auth.Ph)
 		
 		payloadBytes, _ := json.Marshal(payload)
 		fmt.Printf("[%s] Chat Request: %d bytes | Model: %s | Media: %d\n", 
@@ -875,8 +883,17 @@ func processStream(c *gin.Context, body io.Reader, completionID, model string, u
 	}
 
 	// End of stream
+    if failed, _ := c.Get("upstream_protocol_error"); failed == true {
+        c.Writer.WriteString("data: [DONE]\n\n")
+        c.Writer.Flush()
+        return
+    }
 	toolCallStr, toolCalls := utils.ParseToolCalls(fullText.String())
-	_ = toolCallStr
+	if strings.TrimSpace(toolCallStr) == "" && len(toolCalls) == 0 {
+        c.Writer.WriteString("data: {\"error\":{\"type\":\"upstream_error\",\"message\":\"MiMo returned no final answer.\"}}\n\ndata: [DONE]\n\n")
+        c.Writer.Flush()
+        return
+    }
 	finishReason := "stop"
 	if len(toolCalls) > 0 {
 		finishReason = "tool_calls"
@@ -891,7 +908,9 @@ func processStream(c *gin.Context, body io.Reader, completionID, model string, u
 	IncrementTokenStat(os.Getenv("SERVICE_TOKEN"), usage.TotalTokens) // Use first token or specific one
 
 	// Save assistant message to local history
-	services.SaveMessage(userID, "asst_"+completionID, "assistant", fullText.String())
+	if os.Getenv("MIMO_STATELESS") != "1" {
+        services.SaveMessage(userID, "asst_"+completionID, "assistant", fullText.String())
+    }
 
 	// Update failure statistics
 	updateConversationFailStats(userID, fullText.String())
@@ -940,7 +959,18 @@ func processNonStream(c *gin.Context, body io.Reader, completionID, model string
 		}
 	}
 
-	cleanText, toolCalls := utils.ParseToolCalls(fullText.String())
+	if failed, _ := c.Get("upstream_protocol_error"); failed == true {
+        if c.Writer.Header().Get("Content-Type") == "text/event-stream" {
+            c.Writer.WriteString("data: [DONE]\n\n")
+            c.Writer.Flush()
+        }
+        return
+    }
+    cleanText, toolCalls := utils.ParseToolCalls(fullText.String())
+    if strings.TrimSpace(cleanText) == "" && len(toolCalls) == 0 {
+        utils.SendError(c, http.StatusBadGateway, "MiMo returned no final answer.", "upstream_error", nil)
+        return
+    }
 	
 	finishReason := "stop"
 	if len(toolCalls) > 0 {
@@ -1010,13 +1040,17 @@ func processNonStream(c *gin.Context, body io.Reader, completionID, model string
 	}
 
 	// Save assistant message to local history
-	services.SaveMessage(userID, "asst_"+completionID, "assistant", fullText.String())
+	if os.Getenv("MIMO_STATELESS") != "1" {
+        services.SaveMessage(userID, "asst_"+completionID, "assistant", fullText.String())
+    }
 
 	// Update failure statistics
 	updateConversationFailStats(userID, fullText.String())
 
 	// Cache successful non-streaming response
-	services.GlobalCache.Set(cacheKey, nsResponse, 5*time.Minute)
+	if os.Getenv("MIMO_STATELESS") != "1" {
+        services.GlobalCache.Set(cacheKey, nsResponse, 5*time.Minute)
+    }
 	c.JSON(http.StatusOK, nsResponse)
 }
 
@@ -1029,6 +1063,34 @@ var (
 )
 
 func processEvent(c *gin.Context, eventType, dataStr, completionID, model string, isStreaming bool, inThinking, inToolCall, sentToolCallName *bool, currentToolID *string, toolCallIndex *int, toolCallBuffer, fullText, reasoningText *strings.Builder, usage *models.Usage) {
+    if failed, _ := c.Get("upstream_protocol_error"); failed == true { return }
+    var meta struct {
+        MessageType string `json:"messageType"`
+        ReasoningContent string `json:"reasoningContent"`
+    }
+    _ = json.Unmarshal([]byte(dataStr), &meta)
+    kind := eventType
+    if meta.MessageType != "" { kind = meta.MessageType }
+    if kind == "error" || kind == "sensitive_query" || kind == "sensitive_title" {
+        c.Set("upstream_protocol_error", true)
+        // Never forward the private raw provider body or report empty success.
+        if isStreaming {
+            c.Writer.WriteString("data: {\"error\":{\"type\":\"upstream_error\",\"message\":\"MiMo could not complete this request.\"}}\n\n")
+            c.Writer.Flush()
+        } else {
+            utils.SendError(c, http.StatusBadGateway, "MiMo could not complete this request.", "upstream_error", nil)
+        }
+        return
+    }
+    if eventType == "message" && meta.ReasoningContent != "" {
+        reasoningText.WriteString(meta.ReasoningContent)
+        if isStreaming {
+            chunk := utils.CreateChatCompletionChunk(completionID, "", model, nil, meta.ReasoningContent, nil, nil)
+            raw, _ := json.Marshal(chunk)
+            c.Writer.WriteString(fmt.Sprintf("data: %s\n\n", raw))
+            c.Writer.Flush()
+        }
+    }
 	if eventType == "usage" {
 		var u struct {
 			PromptTokens     int `json:"promptTokens"`
